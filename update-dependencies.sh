@@ -79,6 +79,21 @@ BREAKING_FILE=$(mktemp)
 cleanup() { rm -f "$BREAKING_FILE"; }
 trap cleanup EXIT
 
+# True when $1 is the root of a git repository.
+#
+# A plain clone has a `.git` DIRECTORY, but a submodule — and a linked worktree —
+# has a `.git` FILE containing a `gitdir: …` pointer to the real git dir, so a
+# `[ -d "$dir/.git" ]` test silently rejects them. Accept either, then confirm
+# with git that the path really is a repository ROOT (`--show-toplevel` matching
+# the directory itself), so a random subdirectory of an enclosing repo is not
+# mistaken for a repo of its own.
+is_git_repo_root() {
+    local d="$1" top
+    [ -e "$d/.git" ] || return 1
+    top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ -n "$top" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" = "$(cd "$top" 2>/dev/null && pwd -P)" ]
+}
+
 # Determine the default branch for the current repo (via origin/HEAD, with fallbacks).
 detect_default_branch() {
     local b
@@ -353,7 +368,7 @@ for dir in "${candidates[@]}"; do
         failed=$((failed + 1))
         continue
     fi
-    if [ ! -d "$dir/.git" ]; then
+    if ! is_git_repo_root "$dir"; then
         # An explicitly-named non-repo is worth flagging; a scanned one is just noise.
         if [ ${#REPOS[@]} -gt 0 ]; then
             warn "not a git repository: $dir — skipping"
