@@ -13,10 +13,19 @@
 # Advisories that can only be fixed by a BREAKING (major) upgrade are left in
 # place and reported, in a high-visibility color, at the end of the run.
 #
+# Advisories that have already been IGNORED on GitHub — dismissed by hand in the
+# repo's Security tab, or auto-dismissed by GitHub itself — are filtered out of
+# that report, so it only shows work that still needs a decision. The count of
+# hidden advisories is always printed, so the filtering is never silent. This
+# needs the `gh` CLI, authenticated; without it nothing is filtered.
+#
 # Options:
 #   --dry-run   Do everything EXCEPT commit and push. The `update-dependencies`
 #               branch is left in place with the changes so you can inspect
 #               `git diff` / `git status` yourself.
+#   --no-github-ignores
+#               Do not consult GitHub — report every outstanding advisory,
+#               including ones already dismissed there.
 #   -h, --help  Show usage.
 #
 # Arguments:
@@ -30,14 +39,24 @@ set -u
 BRANCH="update-dependencies"
 COMMIT_MSG="update dependencies"
 DRY_RUN=false
+USE_GH_FILTER=true   # consult GitHub for advisories already dismissed there
 REPOS=()   # explicit repo list from positional args; empty => scan current dir
+
+# Per-repo cache flag for the GitHub alert fetch. process_repo runs its body in a
+# subshell, so setting this inside that subshell scopes it to the current repo and
+# the next repo starts from `false` again — no explicit reset needed.
+ALERTS_FETCHED=false
 
 # --- argument parsing --------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [-h|--help] [repo ...]
+Usage: $(basename "$0") [--dry-run] [--no-github-ignores] [-h|--help] [repo ...]
 
   --dry-run   Apply fixes and create the branch, but do NOT commit or push.
+  --no-github-ignores
+              Report every outstanding advisory, including ones already
+              dismissed (or auto-dismissed) on GitHub. By default those are
+              hidden from the final report and only counted.
   -h, --help  Show this help.
 
   repo ...    Optional list of folders to process. When omitted, every folder
@@ -47,12 +66,14 @@ Examples:
   $(basename "$0")                       # every git repo in the current dir
   $(basename "$0") my-app ../other-app   # only these two repos
   $(basename "$0") --dry-run my-app      # dry run against one repo
+  $(basename "$0") --no-github-ignores   # show dismissed advisories too
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true ;;
+        --no-github-ignores) USE_GH_FILTER=false ;;
         -h|--help) usage; exit 0 ;;
         --) shift; while [ $# -gt 0 ]; do REPOS+=("$1"); shift; done; break ;;
         -*) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
@@ -66,6 +87,7 @@ c_reset='\033[0m'; c_info='\033[1;34m'; c_ok='\033[1;32m'; c_warn='\033[1;33m'; 
 # High-visibility styling reserved for the breaking-change report.
 c_break_hdr='\033[1;97;41m'   # bold white text on red background
 c_break='\033[1;91m'          # bold bright red
+c_dim='\033[2;37m'            # dim grey, for the "hidden advisories" footnote
 info() { printf "${c_info}==>${c_reset} %s\n" "$*"; }
 ok()   { printf "${c_ok}  ✓${c_reset} %s\n" "$*"; }
 warn() { printf "${c_warn}  !${c_reset} %s\n" "$*"; }
@@ -76,7 +98,12 @@ processed=0; pushed=0; skipped=0; failed=0
 
 # Collect breaking-change advisories across all repos here (subshells append to it).
 BREAKING_FILE=$(mktemp)
-cleanup() { rm -f "$BREAKING_FILE"; }
+# Advisories suppressed because they are already ignored on GitHub. Only its line
+# count is shown, but keeping the lines makes the filtering auditable.
+IGNORED_FILE=$(mktemp)
+# Scratch space for the current repo's GitHub alerts (rewritten per repo).
+ALERTS_FILE=$(mktemp)
+cleanup() { rm -f "$BREAKING_FILE" "$IGNORED_FILE" "$ALERTS_FILE"; }
 trap cleanup EXIT
 
 # True when $1 is the root of a git repository.
@@ -117,31 +144,135 @@ detect_default_branch() {
     printf '%s' "$b"
 }
 
+# Fetch the advisories this repo has already IGNORED on GitHub: alerts a human
+# dismissed in the Security tab, plus the ones GitHub auto-dismissed on its own
+# (typically low-impact dev dependencies). Both are states we should not keep
+# nagging about, and they are distinct `state` values in the API, so both are
+# requested explicitly.
+#
+# Writes TSV "ecosystem <TAB> package <TAB> ghsa <TAB> cve" to $ALERTS_FILE, once
+# per repo. EVERY failure path leaves that file EMPTY, which makes the reporters
+# fall back to showing everything — filtering on incomplete data would silently
+# hide real advisories, which is far worse than showing a few known ones.
+fetch_dismissed_alerts() {
+    [ "$ALERTS_FETCHED" = true ] && return 0
+    ALERTS_FETCHED=true
+    : >"$ALERTS_FILE"
+
+    [ "$USE_GH_FILTER" = true ] || return 1
+    command -v gh >/dev/null 2>&1 || return 1
+
+    # Only GitHub remotes have Dependabot alerts to read.
+    case "$(git remote get-url origin 2>/dev/null)" in
+        *github.com[:/]*) ;;
+        *) return 1 ;;
+    esac
+
+    # gh expands {owner}/{repo} from the origin remote, so a directory whose name
+    # differs from the repo name — or differs only in case — still resolves.
+    # --jq is built into gh, so this needs no jq binary and keeps the multi-MB
+    # advisory descriptions out of the pipe.
+    if ! gh api "repos/{owner}/{repo}/dependabot/alerts?state=dismissed,auto_dismissed&per_page=100" \
+            --paginate \
+            --jq '.[] | [.dependency.package.ecosystem, .dependency.package.name, .security_advisory.ghsa_id, (.security_advisory.cve_id // "")] | @tsv' \
+            >"$ALERTS_FILE" 2>/dev/null; then
+        # gh writes the REST error body to STDOUT on failure (e.g. HTTP 403 when
+        # Dependabot is disabled for the repo), and a half-finished run leaves a
+        # partial page. Either would masquerade as a valid ignore list, so throw
+        # the whole thing away rather than trust part of it.
+        : >"$ALERTS_FILE"
+        warn "could not read GitHub security alerts — reporting all advisories"
+        return 1
+    fi
+    return 0
+}
+
 # After applying non-breaking npm fixes, list advisories that still require a
 # major (breaking) upgrade, or that have no fix at all. Appends to $BREAKING_FILE.
 report_npm_breaking() {
     local repo="$1"
     command -v node >/dev/null 2>&1 || return 0
+    fetch_dismissed_alerts
     local json
     json=$(mktemp)
     npm audit --json >"$json" 2>/dev/null
-    REPO="$repo" ECOSYSTEM="npm" node -e '
+    REPO="$repo" ECOSYSTEM="npm" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" node -e '
         const fs = require("fs");
         let d;
         try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(0); }
         const repo = process.env.REPO, eco = process.env.ECOSYSTEM;
+
+        // GHSA ids already dismissed / auto-dismissed on GitHub for this repo.
+        const ignored = new Set();
+        try {
+            for (const line of fs.readFileSync(process.env.ALERTS_FILE, "utf8").split("\n")) {
+                const f = line.split("\t");
+                // Anything that is not a well-formed 4-field row is junk (e.g. a
+                // REST error body gh printed to stdout) and must never be able to
+                // suppress an advisory.
+                if (f.length !== 4) continue;
+                if (f[0] === "npm" && f[2]) ignored.add(f[2]);
+            }
+        } catch (e) { /* no alert data => nothing is ignored */ }
+
         const vulns = d.vulnerabilities || {};
-        const lines = [];
+
+        // An entry lists its causes in `via`: advisory OBJECTS (this package is
+        // itself the subject of the advisory) or STRINGS naming another vulnerable
+        // package it depends on. Most entries are string-only — they are flagged
+        // purely transitively and carry no GHSA of their own — so we walk the graph
+        // to the advisory objects at its roots.
+        //
+        // Iterative, with a visited set per starting node. `via` can contain cycles,
+        // and caching a result computed under a cycle guard would return a
+        // too-small root set and silently over-suppress.
+        function rootAdvisories(start) {
+            const out = new Set();
+            const seen = new Set([start]);
+            const stack = [start];
+            while (stack.length) {
+                const node = vulns[stack.pop()];
+                if (!node) continue;
+                for (const x of (node.via || [])) {
+                    if (typeof x === "string") {
+                        if (!seen.has(x)) { seen.add(x); stack.push(x); }
+                    } else if (x) {
+                        const m = x.url && /GHSA-[0-9a-z-]+/.exec(x.url);
+                        // No GHSA means nothing to match against GitHub. Record it
+                        // as an unmatchable root so this entry can never be
+                        // suppressed on the strength of its siblings.
+                        out.add(m ? m[0] : "npm-source:" + x.source);
+                    }
+                }
+            }
+            return out;
+        }
+
+        const lines = [], hidden = [];
         for (const name of Object.keys(vulns)) {
             const v = vulns[name];
             const fa = v.fixAvailable;
+            let detail;
             if (fa === false) {
-                lines.push(`${repo}\t${eco}\t${name} (${v.severity}) — no fix available`);
+                detail = `${name} (${v.severity}) — no fix available`;
             } else if (fa && typeof fa === "object" && fa.isSemVerMajor) {
-                lines.push(`${repo}\t${eco}\t${name} (${v.severity}) — needs ${fa.name}@${fa.version} (MAJOR / breaking)`);
+                detail = `${name} (${v.severity}) — needs ${fa.name}@${fa.version} (MAJOR / breaking)`;
+            } else {
+                continue;
+            }
+            // Suppress only when EVERY root advisory is ignored on GitHub: one
+            // still-open root means this package genuinely needs attention. An
+            // empty root set is unresolvable, so fail open and report it.
+            const roots = rootAdvisories(name);
+            const row = `${repo}\t${eco}\t${detail}`;
+            if (roots.size > 0 && [...roots].every(g => ignored.has(g))) {
+                hidden.push(row);
+            } else {
+                lines.push(row);
             }
         }
         if (lines.length) fs.writeFileSync(1, lines.join("\n") + "\n");
+        if (hidden.length) fs.appendFileSync(process.env.IGNORED_FILE, hidden.join("\n") + "\n");
     ' "$json" >>"$BREAKING_FILE" 2>/dev/null
     rm -f "$json"
 }
@@ -152,21 +283,56 @@ report_npm_breaking() {
 report_composer_breaking() {
     local repo="$1"
     command -v php >/dev/null 2>&1 || return 0
+    fetch_dismissed_alerts
     local json
     json=$(mktemp)
     composer audit --no-interaction --format=json >"$json" 2>/dev/null
-    REPO="$repo" php -r '
+    REPO="$repo" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" php -r '
         $repo = getenv("REPO");
         $raw = @file_get_contents($argv[1]);
         $j = json_decode($raw, true);
         if (!is_array($j) || empty($j["advisories"])) exit(0);
+
+        // Advisory ids already dismissed / auto-dismissed on GitHub, composer only.
+        $ignoredGhsa = [];
+        $ignoredCve  = [];
+        $alerts = @file_get_contents(getenv("ALERTS_FILE"));
+        if ($alerts !== false) {
+            foreach (explode("\n", $alerts) as $line) {
+                $f = explode("\t", $line);
+                // Skip anything that is not a well-formed 4-field row, so a stray
+                // error body can never suppress an advisory.
+                if (count($f) !== 4 || $f[0] !== "composer") continue;
+                if ($f[2] !== "") $ignoredGhsa[$f[2]] = true;
+                if ($f[3] !== "") $ignoredCve[$f[3]]  = true;
+            }
+        }
+
+        $keep = [];
+        $hidden = [];
         foreach ($j["advisories"] as $pkg => $advs) {
             foreach ($advs as $a) {
                 $title = isset($a["title"]) ? $a["title"] : "security advisory";
                 $sev   = isset($a["severity"]) ? $a["severity"] : "unknown";
-                echo $repo . "\t" . "composer" . "\t" . $pkg . " (" . $sev . ") — " . $title . " (needs upgrade outside current constraints)\n";
+
+                // Composer records the GitHub advisory id under sources[]; prefer
+                // it, and fall back to the CVE when this advisory has no GHSA.
+                $ghsa = "";
+                if (!empty($a["sources"]) && is_array($a["sources"])) {
+                    foreach ($a["sources"] as $s) {
+                        if (isset($s["name"], $s["remoteId"]) && $s["name"] === "GitHub") $ghsa = $s["remoteId"];
+                    }
+                }
+                $cve = isset($a["cve"]) ? $a["cve"] : "";
+                $isIgnored = ($ghsa !== "" && isset($ignoredGhsa[$ghsa]))
+                          || ($ghsa === "" && $cve !== "" && isset($ignoredCve[$cve]));
+
+                $line = $repo . "\t" . "composer" . "\t" . $pkg . " (" . $sev . ") — " . $title . " (needs upgrade outside current constraints)\n";
+                if ($isIgnored) { $hidden[] = $line; } else { $keep[] = $line; }
             }
         }
+        echo implode("", $keep);
+        if ($hidden) @file_put_contents(getenv("IGNORED_FILE"), implode("", $hidden), FILE_APPEND);
     ' "$json" >>"$BREAKING_FILE" 2>/dev/null
     rm -f "$json"
 }
@@ -391,6 +557,18 @@ fi
 info "Summary: processed=$processed pushed=$pushed skipped=$skipped failed=$failed"
 
 # --- breaking-change report (high visibility) --------------------------------
+
+# Report how many advisories the GitHub filter removed. Printed in both the
+# "found something" and "all clear" cases on purpose: without it, "nothing is
+# wrong" and "everything was filtered out" would look identical.
+ignored_note() {
+    [ -s "$IGNORED_FILE" ] || return 0
+    local n
+    n=$(wc -l <"$IGNORED_FILE" | tr -d ' ')
+    printf "${c_dim}  (%s advisor%s hidden — already dismissed on GitHub; --no-github-ignores to show)${c_reset}\n" \
+        "$n" "$([ "$n" = 1 ] && echo "y" || echo "ies")"
+}
+
 echo
 if [ -s "$BREAKING_FILE" ]; then
     printf "${c_break_hdr} ⚠  ADVISORIES REQUIRING MANUAL INTERVENTION (breaking/major upgrade or no fix) ${c_reset}\n"
@@ -407,6 +585,8 @@ if [ -s "$BREAKING_FILE" ]; then
     done < "$BREAKING_FILE"
     echo
     printf "${c_break}These were NOT changed — resolving them may require code changes.${c_reset}\n"
+    ignored_note
 else
     ok "No breaking-change advisories left outstanding. 🎉"
+    ignored_note
 fi
