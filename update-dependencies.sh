@@ -10,6 +10,12 @@
 #   5. Applies non-breaking `composer audit` fixes (composer update within constraints)
 #   6. Commits with message "update dependencies" and pushes the branch to origin
 #
+# Steps 4 and 5 run for EVERY manifest in the repo, not just the one at the root —
+# a repo often carries several (app/, tests/tooling, a bundled plugin, …). See
+# `manifest_dirs` for which manifests qualify and, just as importantly, which are
+# deliberately left alone (submodules, ignored trees, committed node_modules /
+# vendor, and vendored libraries that ship a manifest but no lockfile).
+#
 # Advisories that can only be fixed by a BREAKING (major) upgrade are left in
 # place and reported, in a high-visibility color, at the end of the run.
 #
@@ -46,6 +52,13 @@ REPOS=()   # explicit repo list from positional args; empty => scan current dir
 # subshell, so setting this inside that subshell scopes it to the current repo and
 # the next repo starts from `false` again — no explicit reset needed.
 ALERTS_FETCHED=false
+
+# Lockfiles that mark a manifest as an auditable project (see manifest_dirs).
+NPM_LOCKFILES=(package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml)
+COMPOSER_LOCKFILES=(composer.lock)
+# Bundled dependency trees. Some repos commit these outright, so excluding them
+# by path is not optional even when discovery is limited to tracked files.
+VENDOR_DIRS_RE='(^|/)(node_modules|vendor|bower_components)/'
 
 # --- argument parsing --------------------------------------------------------
 usage() {
@@ -144,6 +157,63 @@ detect_default_branch() {
     printf '%s' "$b"
 }
 
+# List the directories in the CURRENT repo that hold a $1 manifest worth auditing,
+# one per line, relative to the repo root ("." for the root itself). Remaining
+# arguments are the lockfile names that make that manifest auditable.
+#
+# Discovery goes through `git ls-files` rather than `find`, which buys three
+# things that matter a lot in practice:
+#   * ignored trees are skipped — e.g. matomo-for-wordpress keeps a whole vendored
+#     WordPress + WooCommerce checkout under docker/, ~40 manifests we must never
+#     touch;
+#   * files inside SUBMODULES are not listed (git reports the gitlink, not its
+#     contents), so we never mutate a submodule from its parent repo — matomo has
+#     a dozen plugins/* submodules;
+#   * only committed, first-party files are considered.
+#
+# Two further filters on top of that:
+#   * bundled dependency trees are dropped by path, because some repos commit
+#     node_modules/ or vendor/ (matomo commits its frontend node_modules);
+#   * a lockfile must sit next to the manifest. That is both a hard requirement —
+#     npm/composer audit resolve installed versions from the lockfile — and a good
+#     proxy for "a project we manage" as opposed to a vendored third-party library
+#     that merely ships a manifest (jquery-timepicker, credis, q-1.4.1, …).
+manifest_dirs() {
+    local manifest="$1"; shift
+    local locks=("$@")
+    local path dir lock
+    # The `*name` pathspec also matches things like "mypackage.json", so re-check
+    # the basename explicitly.
+    git ls-files -- "*$manifest" 2>/dev/null \
+    | grep -E "(^|/)${manifest//./\\.}\$" \
+    | grep -v -E "$VENDOR_DIRS_RE" \
+    | while IFS= read -r path; do
+        dir=$(dirname "$path")
+        for lock in "${locks[@]}"; do
+            if [ -f "$dir/$lock" ]; then printf '%s\n' "$dir"; break; fi
+        done
+    done
+}
+
+# Every directory audited in this repo, npm and composer combined, deduplicated.
+audited_dirs() {
+    {
+        manifest_dirs package.json "${NPM_LOCKFILES[@]}"
+        manifest_dirs composer.json "${COMPOSER_LOCKFILES[@]}"
+    } | sort -u
+}
+
+# Human-readable suffix naming a manifest location: empty at the repo root.
+manifest_label() {
+    [ "$1" = "." ] && printf '' || printf ' (in %s/)' "$1"
+}
+
+# Tag for the report's ecosystem column, so each advisory says which manifest it
+# came from: "npm" at the root, "npm:app/" below it.
+manifest_eco() {
+    [ "$2" = "." ] && printf '%s' "$1" || printf '%s:%s/' "$1" "$2"
+}
+
 # Fetch the advisories this repo has already IGNORED on GitHub: alerts a human
 # dismissed in the Security tab, plus the ones GitHub auto-dismissed on its own
 # (typically low-impact dev dependencies). Both are states we should not keep
@@ -191,12 +261,13 @@ fetch_dismissed_alerts() {
 # major (breaking) upgrade, or that have no fix at all. Appends to $BREAKING_FILE.
 report_npm_breaking() {
     local repo="$1"
+    local subdir="${2:-.}"
     command -v node >/dev/null 2>&1 || return 0
     fetch_dismissed_alerts
     local json
     json=$(mktemp)
     npm audit --json >"$json" 2>/dev/null
-    REPO="$repo" ECOSYSTEM="npm" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" node -e '
+    REPO="$repo" ECOSYSTEM="$(manifest_eco npm "$subdir")" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" node -e '
         const fs = require("fs");
         let d;
         try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(0); }
@@ -282,13 +353,15 @@ report_npm_breaking() {
 # upgrade (i.e. a potentially breaking change). Appends to $BREAKING_FILE.
 report_composer_breaking() {
     local repo="$1"
+    local subdir="${2:-.}"
     command -v php >/dev/null 2>&1 || return 0
     fetch_dismissed_alerts
     local json
     json=$(mktemp)
     composer audit --no-interaction --format=json >"$json" 2>/dev/null
-    REPO="$repo" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" php -r '
+    REPO="$repo" ECOSYSTEM="$(manifest_eco composer "$subdir")" ALERTS_FILE="$ALERTS_FILE" IGNORED_FILE="$IGNORED_FILE" php -r '
         $repo = getenv("REPO");
+        $eco  = getenv("ECOSYSTEM");
         $raw = @file_get_contents($argv[1]);
         $j = json_decode($raw, true);
         if (!is_array($j) || empty($j["advisories"])) exit(0);
@@ -327,7 +400,7 @@ report_composer_breaking() {
                 $isIgnored = ($ghsa !== "" && isset($ignoredGhsa[$ghsa]))
                           || ($ghsa === "" && $cve !== "" && isset($ignoredCve[$cve]));
 
-                $line = $repo . "\t" . "composer" . "\t" . $pkg . " (" . $sev . ") — " . $title . " (needs upgrade outside current constraints)\n";
+                $line = $repo . "\t" . $eco . "\t" . $pkg . " (" . $sev . ") — " . $title . " (needs upgrade outside current constraints)\n";
                 if ($isIgnored) { $hidden[] = $line; } else { $keep[] = $line; }
             }
         }
@@ -342,12 +415,25 @@ report_composer_breaking() {
 # remind the user what needs manual intervention even on re-runs that take an
 # early-exit shortcut (e.g. a dirty tree left behind by a previous dry run).
 report_outstanding_breaking() {
-    local repo="$1"
-    if [ -f package.json ] && command -v npm >/dev/null 2>&1; then
-        report_npm_breaking "$repo"
+    local repo="$1" mdir
+    # Fetch once here, at the repo root, so the per-manifest subshells below
+    # inherit the cache flag instead of hitting the API once per manifest.
+    fetch_dismissed_alerts
+    if command -v npm >/dev/null 2>&1; then
+        while IFS= read -r mdir; do
+            [ -n "$mdir" ] || continue
+            ( cd "$mdir" 2>/dev/null && report_npm_breaking "$repo" "$mdir" )
+        done <<EOF
+$(manifest_dirs package.json "${NPM_LOCKFILES[@]}")
+EOF
     fi
-    if [ -f composer.json ] && command -v composer >/dev/null 2>&1; then
-        report_composer_breaking "$repo"
+    if command -v composer >/dev/null 2>&1; then
+        while IFS= read -r mdir; do
+            [ -n "$mdir" ] || continue
+            ( cd "$mdir" 2>/dev/null && report_composer_breaking "$repo" "$mdir" )
+        done <<EOF
+$(manifest_dirs composer.json "${COMPOSER_LOCKFILES[@]}")
+EOF
     fi
 }
 
@@ -358,10 +444,20 @@ report_outstanding_breaking() {
 # lockfile that isn't tracked yet is added explicitly by name.
 stage_dependency_changes() {
     git add -u || return 1
-    local f
-    for f in package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml composer.json composer.lock; do
-        [ -f "$f" ] && git add -- "$f"
-    done
+    local dirs dir f
+    # `git add -u` already covers edits to tracked lockfiles anywhere in the repo,
+    # including nested ones. This loop only exists for a lockfile that did not
+    # exist before and is therefore still untracked — so it must run for every
+    # manifest directory, not just the repo root.
+    dirs=$(audited_dirs)
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        for f in package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml composer.json composer.lock; do
+            [ -f "$dir/$f" ] && git add -- "$dir/$f"
+        done
+    done <<EOF
+$dirs
+EOF
     return 0
 }
 
@@ -442,32 +538,57 @@ process_repo() {
         git branch -D "$BRANCH" >/dev/null 2>&1
         git checkout -b "$BRANCH" >/dev/null 2>&1 || { err "could not create branch $BRANCH"; exit 1; }
 
+        # Fetch the GitHub ignore list once per repo, before the per-manifest
+        # subshells below, so it is not re-fetched for every manifest.
+        fetch_dismissed_alerts
+
+        local npm_dirs composer_dirs mdir
+
         # --- npm ------------------------------------------------------------
-        if [ -f package.json ]; then
+        # Every auditable package.json in the repo, not just the root one.
+        npm_dirs=$(manifest_dirs package.json "${NPM_LOCKFILES[@]}")
+        if [ -n "$npm_dirs" ]; then
             if command -v npm >/dev/null 2>&1; then
-                info "npm: installing then applying non-breaking audit fixes"
-                # A lockfile + node_modules are needed for `npm audit fix` to work.
-                npm install --no-audit --no-fund >/dev/null 2>&1 || warn "npm install had issues"
-                # No --force  => only semver-compatible (non-breaking) updates.
-                npm audit fix --no-fund >/dev/null 2>&1 || warn "npm audit fix reported issues"
-                ok "npm audit fix complete"
-                report_npm_breaking "$name"
+                while IFS= read -r mdir; do
+                    [ -n "$mdir" ] || continue
+                    info "npm: installing then applying non-breaking audit fixes$(manifest_label "$mdir")"
+                    (
+                        cd "$mdir" || exit 0
+                        # A lockfile + node_modules are needed for `npm audit fix` to work.
+                        npm install --no-audit --no-fund >/dev/null 2>&1 || warn "npm install had issues"
+                        # No --force  => only semver-compatible (non-breaking) updates.
+                        npm audit fix --no-fund >/dev/null 2>&1 || warn "npm audit fix reported issues"
+                        ok "npm audit fix complete$(manifest_label "$mdir")"
+                        report_npm_breaking "$name" "$mdir"
+                    )
+                done <<EOF
+$npm_dirs
+EOF
             else
                 warn "package.json present but npm not installed — skipping npm"
             fi
         fi
 
         # --- composer -------------------------------------------------------
-        if [ -f composer.json ]; then
+        composer_dirs=$(manifest_dirs composer.json "${COMPOSER_LOCKFILES[@]}")
+        if [ -n "$composer_dirs" ]; then
             if command -v composer >/dev/null 2>&1; then
-                info "composer: updating within version constraints (non-breaking)"
-                # Composer has no `audit fix`. `composer update` moves dependencies
-                # to the newest versions allowed by composer.json's constraints,
-                # which (with semver ^/~ constraints) excludes breaking upgrades.
-                composer update --with-all-dependencies --no-interaction >/dev/null 2>&1 \
-                    || warn "composer update reported issues"
-                ok "composer update complete"
-                report_composer_breaking "$name"
+                while IFS= read -r mdir; do
+                    [ -n "$mdir" ] || continue
+                    info "composer: updating within version constraints (non-breaking)$(manifest_label "$mdir")"
+                    (
+                        cd "$mdir" || exit 0
+                        # Composer has no `audit fix`. `composer update` moves dependencies
+                        # to the newest versions allowed by composer.json's constraints,
+                        # which (with semver ^/~ constraints) excludes breaking upgrades.
+                        composer update --with-all-dependencies --no-interaction >/dev/null 2>&1 \
+                            || warn "composer update reported issues"
+                        ok "composer update complete$(manifest_label "$mdir")"
+                        report_composer_breaking "$name" "$mdir"
+                    )
+                done <<EOF
+$composer_dirs
+EOF
             else
                 warn "composer.json present but composer not installed — skipping composer"
             fi
