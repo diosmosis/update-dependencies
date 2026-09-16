@@ -7,7 +7,8 @@
 #   2. Pulls with fast-forward only
 #   3. Creates (or resets) a branch named `update-dependencies`
 #   4. Applies non-breaking `npm audit` fixes   (npm audit fix, WITHOUT --force)
-#   5. Applies non-breaking `composer audit` fixes (composer update within constraints)
+#   5. Applies non-breaking `composer audit` fixes (composer update within
+#      constraints), then regenerates the autoloader with --no-dev
 #   6. Commits with message "update dependencies" and pushes the branch to origin
 #
 # Steps 4 and 5 run for EVERY manifest in the repo, not just the one at the root —
@@ -583,6 +584,11 @@ EOF
                         # which (with semver ^/~ constraints) excludes breaking upgrades.
                         composer update --with-all-dependencies --no-interaction >/dev/null 2>&1 \
                             || warn "composer update reported issues"
+                        # `composer update` leaves an autoloader that includes dev
+                        # packages. Repos that commit vendor/ ship that file, so
+                        # regenerate it without dev entries before it gets staged.
+                        composer dump-autoload --no-dev --no-interaction >/dev/null 2>&1 \
+                            || warn "composer dump-autoload --no-dev reported issues"
                         ok "composer update complete$(manifest_label "$mdir")"
                         report_composer_breaking "$name" "$mdir"
                     )
